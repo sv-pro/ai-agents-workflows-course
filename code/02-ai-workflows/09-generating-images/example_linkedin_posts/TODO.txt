@@ -1,0 +1,6 @@
+ADD YOUR EXAMPLE LINKEDIN POSTS TO THIS FOLDER
+Add one text file per post
+
+- example1.txt
+- example2.txt
+- etc...

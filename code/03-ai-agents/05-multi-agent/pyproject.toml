@@ -1,0 +1,12 @@
+[project]
+name = "agents"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "crawl4ai>=0.6.3",
+    "openai>=1.91.0",
+    "python-dotenv>=1.1.1",
+    "requests>=2.32.4",
+]
