@@ -1,230 +1,278 @@
-import enum
+# open.py
+import os
+import re
 import json
 import time
-import os
+from typing import Dict, Any
+from string import Template
 
-# Run "uv sync" to install the below packages
-from dotenv import load_dotenv
 import requests
+from dotenv import load_dotenv
 
 load_dotenv()
 
-# there are 3 older models ("old" generation)
-# "gemma3:1b-it-qat" is used for summarization
-# "gemma3:4b-it-qat" is used for extraction
-# "gemma3:27b-it-qat" is used for post-generation
-
-# there are 2 newer models ("new" generation)
-# "gemma3n:e2b" is used for summarization
-# "gemma3n:e4b" is used for extraction and post-generation
-
-# the `generation` switch determines which model to use for each task
-# GENERATION is passed as an env variable, the default value is "new"
-VARIATION = os.getenv("VARIATION", "new")
-
-print(f"Using variation: {VARIATION}")
-
-LIGHT_MODEL = "gemma3n:e2b"
-HEAVY_MODEL = "gemma3n:e4b"
-OLLAMA_GENERATE_ENDPOINT = "http://localhost:11434/api/generate"
-SOURCE_URL = "https://maximilian-schwarzmueller.com/articles/gemma-3n-may-be-amazing/"
-
-FASTEST_MODEL = "gemma3:1b-it-qat"
+# -------------------- Variations --------------------
+# old | new | fastest
+VARIATION = os.getenv("VARIATION", "fastest")
+SOURCE_URL = os.getenv(
+    "SOURCE_URL",
+    "https://maximilian-schwarzmueller.com/articles/gemma-3n-may-be-amazing/",
+)
+OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434/api/generate")
 
 MODELS = {
     "old": {
         "summarization": "gemma3:1b-it-qat",
         "extraction": "gemma3:4b-it-qat",
-        "post_generation": "gemma3:27b-it-qat"
+        "post_generation": "gemma3:27b-it-qat",
     },
     "new": {
         "summarization": "gemma3n:e2b",
         "extraction": "gemma3n:e4b",
-        "post_generation": "gemma3n:e4b"
+        "post_generation": "gemma3n:e4b",
     },
     "fastest": {
-        "summarization": FASTEST_MODEL,
-        "extraction": FASTEST_MODEL,
-        "post_generation": FASTEST_MODEL
-    }
+        "summarization": "gemma3:1b-it-qat",
+        "extraction": "gemma3:1b-it-qat",
+        "post_generation": "gemma3:1b-it-qat",
+    },
 }
 
-SUMMARIZATION_MODEL = MODELS[VARIATION]["summarization"]
-EXTRACTION_MODEL = MODELS[VARIATION]["extraction"]
-POST_GENERATION_MODEL = MODELS[VARIATION]["post_generation"]
+# активная модель = summarization (сливаем summary+tweet в один вызов)
+ACTIVE_MODEL = MODELS[VARIATION]["summarization"]
+
+# -------------------- Tunables ---------------------
+NUM_CTX = int(os.getenv("NUM_CTX", "1536"))
+NUM_PREDICT = int(os.getenv("NUM_PREDICT", "220"))
+TEMP = float(os.getenv("TEMP", "0.6"))
+KEEP_ALIVE = os.getenv("KEEP_ALIVE", "30m")
+USE_LLM_EXTRACTION = os.getenv("USE_LLM_EXTRACTION", "0") == "1"  # 0 = быстрый regex-парс
+MAX_INPUT_CHARS = int(os.getenv("MAX_INPUT_CHARS", "6000"))
+
+session = requests.Session()  # reuse TCP for lower latency
 
 
-def get_ai_response(prompt: str, model: str = LIGHT_MODEL, ctx: int = 4000) -> str:
-    response = requests.post(
-        OLLAMA_GENERATE_ENDPOINT,
-        json={
-            "model": model,
-            "prompt": prompt,
-            "stream": False,
-            "options": {
-                "num_ctx": ctx
-            }
-        }
-    )
-
-    try:    
-        response.raise_for_status()
-    except requests.HTTPError as e:
-        print(f"HTTP error occurred: {e}")
-        return ""
-    except Exception as e:
-        print(f"An error occurred: {e}")
-        return ""
-    
-    data = response.json()
-
-    if "response" not in data:
-        print("Unexpected response format:", data)
-        return ""
-    
-    return data["response"]
+# -------------------- Ollama helper ----------------
+def ollama_generate(
+    prompt: str,
+    model: str = ACTIVE_MODEL,
+    num_ctx: int = NUM_CTX,
+    num_predict: int = NUM_PREDICT,
+    temperature: float = TEMP,
+) -> Dict[str, Any]:
+    payload = {
+        "model": model,
+        "prompt": prompt,
+        "stream": False,
+        "keep_alive": KEEP_ALIVE,
+        "options": {
+            "num_ctx": num_ctx,
+            "num_predict": num_predict,
+            "temperature": temperature,
+        },
+    }
+    r = session.post(OLLAMA_URL, json=payload, timeout=180)
+    r.raise_for_status()
+    return r.json()  # includes response + eval/prompt_eval metrics
 
 
-
+# -------------------- Fetch HTML -------------------
 def get_website_html(url: str) -> str:
+    r = session.get(url, timeout=30)
+    r.raise_for_status()
+    # Robust decoding (avoid Ã¼ etc.)
+    enc = r.encoding or getattr(r, "apparent_encoding", None) or "utf-8"
     try:
-        response = requests.get(url)
-        response.raise_for_status()  # Raise an error for bad responses
-        return response.text
-    except requests.RequestException as e:
-        print(f"Error fetching the URL {url}: {e}")
-        return ""
+        return r.content.decode(enc, errors="ignore")
+    except Exception:
+        return r.text
 
 
-def extract_core_website_content(html: str) -> str:
-    
-    response = get_ai_response(
-        # model="gemma3:4b-it-qat",
-        model=EXTRACTION_MODEL,
-        prompt=f"""
-            You are an expert web content extractor. Your task is to extract the core content from a given HTML page.
-            The core content should be the main text, excluding navigation, footers, and other non-essential elements like scripts etc.
+# ----------- Fast (non-LLM) content extract --------
+def extract_core_fast(html: str) -> str:
+    # drop scripts/styles/nav/footer
+    html = re.sub(r"(?is)<script[^>]*>.*?</script>", " ", html)
+    html = re.sub(r"(?is)<style[^>]*>.*?</style>", " ", html)
+    html = re.sub(r"(?is)<nav[^>]*>.*?</nav>", " ", html)
+    html = re.sub(r"(?is)<footer[^>]*>.*?</footer>", " ", html)
 
-            Here is the HTML content:
-            <html>
-            {html}
-            </html>
+    # strip tags → text
+    text = re.sub(r"(?is)<[^>]+>", " ", html)
+    text = re.sub(r"[ \t\r\f\v]+", " ", text)
+    text = re.sub(r"\n{2,}", "\n", text).strip()
 
-            Please extract the core content and return it as plain text.
-        """,
-        ctx=8192
-    )
-
-    return response
+    # take head + small tail (often contains conclusion)
+    head = text[:MAX_INPUT_CHARS]
+    tail = "\n...\n" + text[-MAX_INPUT_CHARS // 6 :] if len(text) > MAX_INPUT_CHARS else ""
+    return (head + tail).strip()
 
 
-def summarize_content(content: str) -> str:
-    response = get_ai_response(
-        # model="gemma3:1b-it-qat",
-        model=SUMMARIZATION_MODEL,
-        prompt=f"""
-            You are an expert summarizer. Your task is to summarize the provided content into a concise and clear summary.
+# --------------- Optional LLM extraction -----------
+def extract_core_llm(html: str) -> str:
+    prompt = f"""You extract the main article text from an HTML page (no menus/footers/scripts).
+Return plain text only.
 
-            Here is the content to summarize:
-            <content>
-            {content}
-            </content>
-
-            Please provide a brief summary of the main points in the content. Prefer bullet points and avoid unncessary explanations.
-        """
-    )
-
-    return response
-
-
-def generate_x_post(summary: str) -> str:
-    with open("post-examples.json", "r") as f:
-        examples = json.load(f)
-
-    examples_str = ""
-    for i, example in enumerate(examples, 1):
-        examples_str += f"""
-        <example-{i}>
-            <topic>
-            {example['topic']}
-            </topic>
-
-            <generated-post>
-            {example['post']}
-            </generated-post>
-        </example-{i}>
-        """
-
-    prompt = f"""
-        You are an expert social media manager, and you excel at crafting viral and highly engaging posts for X (formerly Twitter).
-
-        Your task is to generate a post based on a short text summary.
-        Your post must be concise and impactful.
-        Avoid using hashtags and lots of emojis (a few emojis are okay, but not too many).
-
-        Keep the post short and focused, structure it in a clean, readable way, using line breaks and empty lines to enhance readability.
-
-        Here's the text summary which you should use to generate the post:
-        <summary>
-        {summary}
-        </summary>
-
-        Here are some examples of topics and generated posts:
-        <examples>
-            {examples_str}
-        </examples>
-
-        Please use the tone, language, structure , and style of the examples provided above to generate a post that is engaging and relevant to the topic provided by the user.
-        Don't use the content from the examples!
+<html>
+{html}
+</html>
 """
-    response = get_ai_response(
-        # model="gemma3:27b-it-qat",
-        model=POST_GENERATION_MODEL,
-        prompt=prompt
+    j = ollama_generate(
+        prompt,
+        model=MODELS[VARIATION]["extraction"],
+        num_ctx=max(NUM_CTX, 2048),
+        num_predict=NUM_PREDICT,
+    )
+    return j.get("response", "").strip()
+
+
+# -------- robust JSON extraction helper ----------
+def _first_json_object(text: str):
+    """
+    Robustly extract the first valid JSON object from arbitrary text.
+    Tries json.JSONDecoder().raw_decode() starting at every '{'.
+    Returns a Python dict or None.
+    """
+    dec = json.JSONDecoder()
+    s = text.strip()
+    for i, ch in enumerate(s):
+        if ch == "{":
+            try:
+                obj, _ = dec.raw_decode(s[i:])
+                if isinstance(obj, dict):
+                    return obj
+            except Exception:
+                continue
+    return None
+
+
+# --------- One-call summary + X post (JSON) --------
+GEN_PROMPT = r"""You produce STRICT JSON only. No prose, no code fences.
+Schema:
+{
+  "summary": ["str", ...],    // 4-6 items, each ≤14 words, no emojis/hashtags
+  "x_post": "str"             // ≤240 chars, max 1 emoji, only #AI hashtag if any
+}
+
+Rules:
+- Output EXACTLY one JSON object matching the schema above.
+- Keys: summary (array of strings), x_post (string). No extra keys.
+- Escape quotes. Do NOT include backticks or markdown.
+- If content is ambiguous, still return valid JSON matching the schema.
+
+<content>
+$CONTENT
+</content>
+"""
+
+
+def summarize_and_make_x_post(content: str) -> dict:
+    prompt = Template(GEN_PROMPT).safe_substitute(CONTENT=content[:MAX_INPUT_CHARS])
+    j = ollama_generate(
+        prompt,
+        model=ACTIVE_MODEL,
+        num_ctx=NUM_CTX,
+        num_predict=NUM_PREDICT,
+        temperature=TEMP,
     )
 
-    return response
+    # perf metrics
+    ec, ed = j.get("eval_count", 0), j.get("eval_duration", 1)
+    pc, pd = j.get("prompt_eval_count", 0), j.get("prompt_eval_duration", 1)
+    decode_tps = (ec / (ed / 1e9)) if ed else 0.0
+    prefill_tps = (pc / (pd / 1e9)) if pd else 0.0
+    print(f"[perf] decode_tps={decode_tps:.1f} tok/s, prefill_tps={prefill_tps:.1f} tok/s")
+
+    raw = (j.get("response") or "").strip()
+
+    # 1) extract first valid JSON object
+    data = _first_json_object(raw)
+
+    # 2) if still None, try to normalize curly quotes and retry
+    if data is None:
+        cleaned = (
+            raw.replace("\u201c", '"')
+            .replace("\u201d", '"')
+            .replace("\u2018", "'")
+            .replace("\u2019", "'")
+        )
+        data = _first_json_object(cleaned)
+
+    # 3) last-resort fallback
+    if not isinstance(data, dict):
+        short = " ".join(raw.split())
+        return {"summary": [short[:200]], "x_post": short[:240]}
+
+    # ---- schema coercion ----
+    summary = data.get("summary", [])
+    x_post = data.get("x_post", "")
+
+    # summary → list[str]
+    if isinstance(summary, str):
+        summary = [s.strip(" -*•") for s in summary.splitlines() if s.strip()]
+    elif not isinstance(summary, list):
+        summary = [str(summary)]
+
+    summary = [s for s in (s.strip() for s in summary) if s]
+
+    def cap_words(s, n=14):
+        return " ".join(s.split()[:n])
+
+    summary = [cap_words(s) for s in summary][:6]
+
+    # ensure at least 4 bullets if content available
+    if len(summary) < 4 and content:
+        extras = [s for s in re.split(r"[.!?]\s+", content[:800]) if s.strip()]
+        for e in extras:
+            if len(summary) >= 4:
+                break
+            summary.append(cap_words(e))
+
+    # x_post → str (collapse list, trim, cap)
+    if isinstance(x_post, list):
+        x_post = " ".join(str(x) for x in x_post)
+    x_post = " ".join(str(x_post).split())[:240]
+    x_post = x_post.rstrip(",;")
+
+    return {"summary": summary, "x_post": x_post}
 
 
+# ----------------------- Main ----------------------
 def main():
-    # website_url = input("Website URL: ")
-    website_url = SOURCE_URL
-    
-    print("Fetching website HTML...")
-    try:
-        html_content = get_website_html(website_url)
-    except Exception as e:
-        print(f"An error occurred while fetching the website: {e}")
-        return
-
-    if not html_content:
-        print("Failed to fetch the website content. Exiting.")
-        return
+    print(f"Using variation: {VARIATION} | model: {ACTIVE_MODEL}")
 
     t0 = time.time()
+    print("Fetching website HTML...")
+    html = get_website_html(SOURCE_URL)
 
     print("---------")
-    print("Extracting core content from the website...")
-    core_content = extract_core_website_content(html_content)
-    print("Extracted core content:")
-    print(core_content)
+    print("Extracting core content...")
+    t_ex0 = time.time()
+    core = extract_core_llm(html) if USE_LLM_EXTRACTION else extract_core_fast(html)
+    t_ex1 = time.time()
+    print("Extracted core content (truncated view):")
+    preview = core[:800] + ("\n...\n" if len(core) > 800 else "")
+    print(preview)
 
     print("---------")
-    print("Summarizing the core content...")
-    summary = summarize_content(core_content)
-    print("Generated summary:")
-    print(summary)
+    print("Summarize + X post (single LLM call)...")
+    t_llm0 = time.time()
+    out = summarize_and_make_x_post(core)
+    t_llm1 = time.time()
 
+    print("Summary:")
+    for b in out.get("summary", []):
+        print(f"* {b}")
+
+    print("\nX post:")
+    print(out.get("x_post", ""))
+
+    total = time.time() - t0
     print("---------")
-    print("Generating X post based on the summary...")
-    x_post = generate_x_post(summary)
-    print("Generated X post:")
-    print(x_post)
-
-    t1 = time.time()
-    elapsed_time = t1 - t0
-    print(f"Total elapsed time: {elapsed_time:.2f} seconds")
+    print(f"Extract time: {t_ex1 - t_ex0:.2f}s | LLM time: {t_llm1 - t_llm0:.2f}s | Total: {total:.2f}s")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        print("ERROR:", e)
