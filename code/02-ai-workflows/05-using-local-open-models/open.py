@@ -1,5 +1,7 @@
 import enum
 import json
+import time
+import os
 
 # Run "uv sync" to install the below packages
 from dotenv import load_dotenv
@@ -7,15 +9,49 @@ import requests
 
 load_dotenv()
 
+# there are 3 older models ("old" generation)
+# "gemma3:1b-it-qat" is used for summarization
+# "gemma3:4b-it-qat" is used for extraction
+# "gemma3:27b-it-qat" is used for post-generation
+
+# there are 2 newer models ("new" generation)
+# "gemma3n:e2b" is used for summarization
+# "gemma3n:e4b" is used for extraction and post-generation
+
+# the `generation` switch determines which model to use for each task
+# GENERATION is passed as an env variable, the default value is "new"
+VARIATION = os.getenv("VARIATION", "new")
+
+print(f"Using variation: {VARIATION}")
+
 LIGHT_MODEL = "gemma3n:e2b"
 HEAVY_MODEL = "gemma3n:e4b"
 OLLAMA_GENERATE_ENDPOINT = "http://localhost:11434/api/generate"
 SOURCE_URL = "https://maximilian-schwarzmueller.com/articles/gemma-3n-may-be-amazing/"
 
-# introduce Model enum
-class Model(str, enum.Enum):
-    LIGHT = LIGHT_MODEL
-    HEAVY = HEAVY_MODEL
+FASTEST_MODEL = "gemma3:1b-it-qat"
+
+MODELS = {
+    "old": {
+        "summarization": "gemma3:1b-it-qat",
+        "extraction": "gemma3:4b-it-qat",
+        "post_generation": "gemma3:27b-it-qat"
+    },
+    "new": {
+        "summarization": "gemma3n:e2b",
+        "extraction": "gemma3n:e4b",
+        "post_generation": "gemma3n:e4b"
+    },
+    "fastest": {
+        "summarization": FASTEST_MODEL,
+        "extraction": FASTEST_MODEL,
+        "post_generation": FASTEST_MODEL
+    }
+}
+
+SUMMARIZATION_MODEL = MODELS[VARIATION]["summarization"]
+EXTRACTION_MODEL = MODELS[VARIATION]["extraction"]
+POST_GENERATION_MODEL = MODELS[VARIATION]["post_generation"]
 
 
 def get_ai_response(prompt: str, model: str = LIGHT_MODEL, ctx: int = 4000) -> str:
@@ -64,7 +100,7 @@ def extract_core_website_content(html: str) -> str:
     
     response = get_ai_response(
         # model="gemma3:4b-it-qat",
-        model=Model.LIGHT,
+        model=EXTRACTION_MODEL,
         prompt=f"""
             You are an expert web content extractor. Your task is to extract the core content from a given HTML page.
             The core content should be the main text, excluding navigation, footers, and other non-essential elements like scripts etc.
@@ -85,7 +121,7 @@ def extract_core_website_content(html: str) -> str:
 def summarize_content(content: str) -> str:
     response = get_ai_response(
         # model="gemma3:1b-it-qat",
-        model=Model.LIGHT,
+        model=SUMMARIZATION_MODEL,
         prompt=f"""
             You are an expert summarizer. Your task is to summarize the provided content into a concise and clear summary.
 
@@ -143,7 +179,7 @@ def generate_x_post(summary: str) -> str:
 """
     response = get_ai_response(
         # model="gemma3:27b-it-qat",
-        model=Model.HEAVY,
+        model=POST_GENERATION_MODEL,
         prompt=prompt
     )
 
@@ -165,6 +201,8 @@ def main():
         print("Failed to fetch the website content. Exiting.")
         return
 
+    t0 = time.time()
+
     print("---------")
     print("Extracting core content from the website...")
     core_content = extract_core_website_content(html_content)
@@ -182,6 +220,10 @@ def main():
     x_post = generate_x_post(summary)
     print("Generated X post:")
     print(x_post)
+
+    t1 = time.time()
+    elapsed_time = t1 - t0
+    print(f"Total elapsed time: {elapsed_time:.2f} seconds")
 
 
 if __name__ == "__main__":
