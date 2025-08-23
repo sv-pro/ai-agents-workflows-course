@@ -1,3 +1,4 @@
+import enum
 import json
 
 # Run "uv sync" to install the below packages
@@ -6,10 +7,20 @@ import requests
 
 load_dotenv()
 
+LIGHT_MODEL = "gemma3n:e2b"
+HEAVY_MODEL = "gemma3n:e4b"
+OLLAMA_GENERATE_ENDPOINT = "http://localhost:11434/api/generate"
+SOURCE_URL = "https://maximilian-schwarzmueller.com/articles/gemma-3n-may-be-amazing/"
 
-def get_ai_response(prompt: str, model: str = "gemma3:1b-it-qat", ctx: int = 4000) -> str:
+# introduce Model enum
+class Model(str, enum.Enum):
+    LIGHT = LIGHT_MODEL
+    HEAVY = HEAVY_MODEL
+
+
+def get_ai_response(prompt: str, model: str = LIGHT_MODEL, ctx: int = 4000) -> str:
     response = requests.post(
-        "http://localhost:11434/api/generate",
+        OLLAMA_GENERATE_ENDPOINT,
         json={
             "model": model,
             "prompt": prompt,
@@ -50,8 +61,10 @@ def get_website_html(url: str) -> str:
 
 
 def extract_core_website_content(html: str) -> str:
+    
     response = get_ai_response(
-        model="gemma3:4b-it-qat",
+        # model="gemma3:4b-it-qat",
+        model=Model.LIGHT,
         prompt=f"""
             You are an expert web content extractor. Your task is to extract the core content from a given HTML page.
             The core content should be the main text, excluding navigation, footers, and other non-essential elements like scripts etc.
@@ -63,7 +76,7 @@ def extract_core_website_content(html: str) -> str:
 
             Please extract the core content and return it as plain text.
         """,
-        ctx=20000
+        ctx=8192
     )
 
     return response
@@ -71,7 +84,8 @@ def extract_core_website_content(html: str) -> str:
 
 def summarize_content(content: str) -> str:
     response = get_ai_response(
-        model="gemma3:1b-it-qat",
+        # model="gemma3:1b-it-qat",
+        model=Model.LIGHT,
         prompt=f"""
             You are an expert summarizer. Your task is to summarize the provided content into a concise and clear summary.
 
@@ -128,7 +142,8 @@ def generate_x_post(summary: str) -> str:
         Don't use the content from the examples!
 """
     response = get_ai_response(
-        model="gemma3:27b-it-qat",
+        # model="gemma3:27b-it-qat",
+        model=Model.HEAVY,
         prompt=prompt
     )
 
@@ -136,7 +151,9 @@ def generate_x_post(summary: str) -> str:
 
 
 def main():
-    website_url = input("Website URL: ")
+    # website_url = input("Website URL: ")
+    website_url = SOURCE_URL
+    
     print("Fetching website HTML...")
     try:
         html_content = get_website_html(website_url)
